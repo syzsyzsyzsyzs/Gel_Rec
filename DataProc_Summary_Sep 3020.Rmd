@@ -1,0 +1,503 @@
+# 一、导入：函数库，设置路径，自己写的小函数
+* 样品参数，比例尺，时间点数，时间间隔
+
+```{r setup}
+library(knitr)
+library(ggplot2)
+library(gridExtra)
+library(GGally)
+library(Rmisc)
+resize_in_python <- 1500/1920
+video_height <- 1080*resize_in_python
+
+# 关于文件
+origin <- resize_in_python*c(x = 1208.531, y = 557.500) # ImageJ 上找到的容器圆心
+point.at.boundary <- resize_in_python*c(x = 761.5000, y = 719.500) # ImageJ上找到的容器器壁一点
+
+# 关于时间
+time.interval <- 5 # 设置画图时每张图的时间间隔
+t0 <- 0
+tt <- 5
+
+# 关于样品
+sample_ID <- '1139'
+mass.gram <- 87.66/1000 # 样品质量
+
+shape <- 'rec' # 'rec' or 'circ'
+r.m <- 0.00382/2
+a.m <- 0.006 # 样品长 （假设是矩形）
+b.m <- 0.003 # 样品宽 （假设是矩形）
+
+alpha_factor.trace <- (2/time.interval)^(1/1.7)
+if (alpha_factor.trace > 1){
+  alpha_factor.trace <- 1
+} else {
+  alpha_factor.trace <- (2/time.interval)^(1/1.7)
+}
+
+R.px <- sqrt(sum((origin - point.at.boundary)^2))+7 # 根据上面两点求容器半径
+scale.on.graph.mm_px <- 92.5/R.px # 比例尺 实际尺寸/像素
+```
+
+## 1. **产生**四个点的相对位置
+* 用法：fourpoint_relative_position(文件名.csv）
+* 输入参数：用imageJ，在追踪对象四角点四个点（如矩形的四个点）+ 红蓝两个识别参照物的中心。共6个点，每个点X，Y两个坐标在左右两列，不用表头
+```{r}
+fourpoint_relative_position <- function(fourpoint_file){
+  fourpoint <- read.csv('four_point_position.csv', header = F)
+  colnames(fourpoint) <- c('X', 'Y')
+  t_angle <- atan2(x = (fourpoint$X[6]-fourpoint$X[5]),
+                   y = (fourpoint$Y[6]-fourpoint$Y[5]))
+  
+  a <- fourpoint$X[5]
+  b <- fourpoint$Y[5]
+  
+  new_coord <- data.frame(matrix(0,6,2))
+  colnames(new_coord) <- c('X', 'Y')
+  new_coord$X <- fourpoint$X*cos(t_angle) + fourpoint$Y*sin(t_angle) - a*cos(t_angle) - b*sin(t_angle)
+  new_coord$Y <- -fourpoint$X*sin(t_angle) + fourpoint$Y*cos(t_angle) + a*sin(t_angle) - b*cos(t_angle)
+  return(new_coord)
+}
+```
+
+
+## 2. 根据识别到的红蓝两个圈的位置，**产生**每个时刻矩形四个角的位置
+* 用法：Generate_Points_position(圈1每刻X & Y坐标， 圈2每刻X & Y坐标， 上面函数输出结果）
+```{r}
+Generate_Points_position <- function(position_5,position_6, fourpoint_relative_position){
+  new_coord <- fourpoint_relative_position
+  t_angle <- atan2(x = (position_6[,1]-position_5[,1]), y = (position_6[,2]-position_5[,2]))
+  
+  a1 <- position_5[,1]
+  b1 <- position_5[,2]
+  
+  sample_number <- dim(position_5)[1]
+  origin_newcoord <- data.frame(matrix(0,sample_number,2))
+  colnames(origin_newcoord) <- c('X','Y')
+  origin_newcoord$X <- -a1*cos(t_angle) - b1*sin(t_angle)
+  origin_newcoord$Y <- a1*sin(t_angle) - b1*cos(t_angle)
+  
+  fourpoint_position <- data.frame(matrix(0,5*sample_number,4))
+  
+  colnames(fourpoint_position) <- c('X', 'Y', 'Point_ID','Sample_No')
+  temp_x <- matrix(0,5,sample_number)
+  temp_y <- matrix(0,5,sample_number)
+  
+  temp_x <- new_coord$X[c(2,1,4,1,3)] %*% t(cos(-t_angle)) + new_coord$Y[c(2,1,4,1,3)] %*% t(sin(-t_angle)) -
+    matrix(rep(origin_newcoord$X * cos(-t_angle),5), 5, sample_number, byrow = T) -  
+    matrix(rep(origin_newcoord$Y * sin(-t_angle),5), 5, sample_number, byrow = T)
+  temp_y <- -new_coord$X[c(2,1,4,1,3)] %*% t(sin(-t_angle)) + new_coord$Y[c(2,1,4,1,3)] %*% t(cos(-t_angle)) + 
+    matrix(rep(origin_newcoord$X * sin(-t_angle),5), 5, sample_number, byrow = T) - 
+    matrix(rep(origin_newcoord$Y * cos(-t_angle),5), 5, sample_number, byrow = T)
+  
+  fourpoint_position$X <- matrix(temp_x,5*sample_number,1)
+  fourpoint_position$Y <- matrix(temp_y,5*sample_number,1)
+  fourpoint_position$Point_ID <- rep(1:5,sample_number)
+  
+  sample_number_matrix <- matrix(rep(1:sample_number,5),sample_number, 5)
+  fourpoint_position$Sample_No <- matrix(t(sample_number_matrix), 5*sample_number,1) 
+  
+  return(fourpoint_position)
+}
+```
+
+
+## 3. 透明度计算
+```{r}
+alpha_factor.cruve = function(f.1 = Sample_number, k = 5200, f.2 = time.interval){
+  alp <-1.6 - log10(f.1/300)/3 - log10(f.2)/3
+  if (alp > 1){
+    alp <- 1
+  } 
+  return (alp)
+}
+```
+
+## 4. 画图函数
+* 用法：datacurve(数据名称，X变量，Y变量，Y名称)
+```{r} 
+datacurve <- function(data_infunc, low.q = 0.01, up.q = 0.99,
+                      title = NULL, i_point = i, 
+                      time.interval_infunc = time.interval,
+                      yLowerLim = F,
+                      yUpperLim = F,
+                      alpha_factor = alpha_factor.cruve(),
+                      draw_line = 0){
+  x_name <- colnames(data_infunc)[1]
+  y_name <- colnames(data_infunc)[2]
+  x_lab <-  'Time(s)'
+  if (time.interval_infunc < 100){
+    if (!yLowerLim){
+      yLowerLim = quantile(data_infunc[,2], low.q)
+      yUpperLim = quantile(data_infunc[,2], up.q)
+    }
+    gplot <- ggplot(data = data_infunc, aes(x = data_infunc[,1], y = data_infunc[,2]))
+    gplot <- gplot + geom_point(aes(colour = data_infunc[,1]), shape =20, alpha = alpha_factor, size = 1)
+    gplot <- gplot + geom_line(linetype = draw_line, alpha = 0.3, size = 0.5)
+    gplot <- gplot + scale_color_gradientn(name = x_lab, colors = topo.colors(Sample_number))
+    gplot <- gplot + theme_bw()
+    gplot <- gplot + theme(panel.grid.minor = element_blank())
+    # gplot <- gplot + labs(x = x_lab, y = y_lab)
+    gplot <- gplot + theme(axis.title.x=element_blank(),
+                           axis.text.x=element_blank())
+    gplot <- gplot + scale_x_continuous(limits = c(i_point, i_point + time.interval_infunc),
+                                        breaks=round(seq(from = i_point, to = i_point+time.interval_infunc,
+                                                         length.out = 9), digits = 1))
+    gplot <- gplot + scale_y_continuous(limits = c(yLowerLim, yUpperLim), 
+                                        breaks= signif(seq(from = yLowerLim, to = yUpperLim, length.out = 5),
+                                                       digits = 3))
+    gplot <- gplot + guides(color = 'none')
+    
+    if (0 >= yLowerLim & 0 <= yUpperLim){gplot <- gplot + geom_hline(yintercept = 0, linetype = 2)}
+  } else {
+    low.q = 0.05; up.q = 0.95
+    if (!yLowerLim){
+      yLowerLim = quantile(data_infunc[,2], low.q)
+      yUpperLim = quantile(data_infunc[,2], up.q)
+    }
+    gplot <- ggplot(data = data_infunc, aes(x = data_infunc[,1], y = data_infunc[,2]))
+    gplot <- gplot + geom_point(aes(colour = data_infunc[,1]), shape =20, alpha = alpha_factor, size = 0.5)
+    gplot <- gplot + geom_line(linetype = draw_line, alpha = 0.4, size = 0.2)
+    gplot <- gplot + scale_color_gradientn(name = x_lab, colors = topo.colors(Sample_number))
+    gplot <- gplot + theme_bw()
+    gplot <- gplot + theme(panel.grid.minor = element_blank())
+    # gplot <- gplot + labs(x = x_lab, y = y_lab)
+    gplot <- gplot + theme(axis.title.x=element_blank(),
+                           axis.text.x=element_blank())
+    gplot <- gplot + scale_x_continuous(limits = c(i_point, i_point + time.interval_infunc),
+                                        breaks=round(seq(from = i_point, to = i_point+time.interval_infunc,
+                                                         length.out = 9), digits = 1))
+    gplot <- gplot + scale_y_continuous(limits = c(yLowerLim, yUpperLim), 
+                                        breaks= signif(seq(from = yLowerLim, to = yUpperLim,
+                                                           length.out = 5), digits = 3))
+    gplot <- gplot + guides(color = 'none')
+    
+    if (0 >= yLowerLim & 0 <= yUpperLim) {gplot <- gplot + geom_hline(yintercept = 0, linetype = 2)}
+    }
+  return(gplot)
+}
+```
+
+## 5. 清除没有同时识别到两个圈的时间点数据
+* 去除没有同时识别到两个圈的时间点数据
+```{r}
+left_Red_and_Blue <- function(file_blue = 'coord_blue_csv', file_red = 'coord_red.csv', time_start = t0, time_end = tt){
+  blue <- read.csv(file_blue, header = F)
+  red <- read.csv(file_red, header = F)
+  
+  colnames(blue) <- c('X', 'Y', 'time_s')
+  colnames(red) <- c('X', 'Y', 'time_s')
+  
+  blue_no_dup <- blue[!duplicated(blue$time_s),]
+  red_no_dup <- red[!duplicated(red$time_s),]
+  
+  blue_intersect <- blue_no_dup[is.element(blue_no_dup$time_s, 
+                    red_no_dup$time_s),]
+  red_intersect <- red_no_dup[is.element(red_no_dup$time_s, 
+                    blue_no_dup$time_s),]
+  blue_start <- subset(blue_intersect, time_s > time_start & time_s < time_end)
+  red_start <- subset(red_intersect, time_s > time_start & time_s < time_end)
+  return(list(blue_start, red_start))
+}
+```
+
+## 6. 计算动能（根据参数设定中“shape”，调整公式，只要输入正确的“shape”，‘r.m', 'a.m', 'b.m'即可
+```{r}
+Kinetics <- function(shape_infunc = shape, r.m1 = NULL, a.m1 = NULL, b.m1 = NULL, 
+                     m.g = mass.gram,  v.mm_sec = Velocity.mm_sec[,2], 
+                     w.RPM = Rotation.speed.RPM[,2]){
+  if (shape_infunc == 'rec'){
+    Ek <- 1/2*m.g/1000*(v.mm_sec/1000)^2 + 1/2*(w.RPM/30*pi)^2*(1/12*m.g/1000*(a.m1^2+b.m1^2))
+  } else if (shape_infunc == 'circ'){
+    Ek <- 1/2*m.g/1000*(v.mm_sec/1000)^2 + 1/2*(w.RPM/30*pi)^2*(1/2*m.g/1000*r.m1^2)
+  }
+  Ek_nJ <- Ek*1e9
+  return(Ek_nJ)
+}
+```
+
+## 7. 微分作用函数
+```{r}
+diff.para <- function(data_infunc,
+                      length_infunc = Sample_number,
+                      x_name = 'Time.sec',
+                      y_name,
+                      scale_infunc = scale.on.graph.mm_px,
+                      resol = 0.01,
+                      type){
+  i <- 1; j <- 1; k <- 1
+  pre.output <- data.frame(matrix(NA, length_infunc, 2))
+  colnames(pre.output) <- c(x_name, y_name)
+  while(T){
+    if ((data_infunc[j,1] - data_infunc[i,1])> resol){
+      if (type == 'v'){
+        pre.output[k, 2] <- scale_infunc * 
+          sqrt((data_infunc[j,2] - data_infunc[i,2])^2 +
+          (data_infunc[j,3] - data_infunc[i,3])^2)/
+          (data_infunc[j,1] - data_infunc[i,1])
+      } else if (type == 'deg'){
+        pre.output[k, 2] <- scale_infunc * 
+          ((data_infunc[j,2] - data_infunc[i,2])/
+          (data_infunc[j,1] - data_infunc[i,1]))/360*60
+      } else if (type == 'disp'){
+        if (k <= 1){
+          pre.output[k, 2] <- scale_infunc * 
+            sqrt((data_infunc[j,2] - data_infunc[i,2])^2 + (data_infunc[j,3] - data_infunc[i,3])^2)
+        } else if (k>1){
+          pre.output[k,2] <- pre.output[k-1,2] + scale_infunc * 
+            sqrt((data_infunc[j,2] - data_infunc[i,2])^2 + (data_infunc[j,3] - data_infunc[i,3])^2)
+        }
+        
+      }
+      
+      pre.output[k, 1] <- mean(c(data_infunc[j,1],data_infunc[i,1]))
+      i <- j
+      k <- k + 1
+    } else{
+      j <- j + 1
+    }
+    if(j >= Sample_number - 10){
+      break
+    }
+  }
+  output <- pre.output[complete.cases(pre.output),]
+  return(output)
+}
+```
+
+## 8. 去掉角度在180度的突变
+```{r}
+Angle.Continue <- function(data_infunc,
+                           length_infunc = Sample_number,
+                           threshold = 180.001
+                           ){
+  i <- 1
+  output <- data_infunc
+  while(T) {
+    if ((output[i+1,2] - output[i,2]) > threshold){
+      output[(i+1):length_infunc,2] <-
+        output[(i+1):length_infunc,2] - 360
+    } else if ((output[i+1,2] - output[i,2]) < -threshold){
+      output[(i+1):length_infunc,2] <-
+        output[(i+1):length_infunc,2] + 360
+    } else {i <- i + 1}
+    if ( i >= length_infunc){
+      break
+    }
+  }
+  return(output)
+}
+```
+# 二、获得基本数据
+* 设定起始和终止时间！！
+* 导入ImageJ的4+2坐标 -> 四点相对位置，
+* 导入红蓝两点位置+得到的四点相对位置 -> 每刻红蓝圈周围四点位置
+```{r}
+# Generate basic data
+temp_list <- left_Red_and_Blue('coord_blue.csv', 'coord_red.csv', 
+                               time_start = t0, 
+                               time_end = tt)
+blue_start <- temp_list[[1]]
+red_start <- temp_list[[2]]
+
+center <- (blue_start[,1:2] + red_start[,1:2])/2
+direct <- atan2(x = blue_start$X-red_start$X, y = blue_start$Y-red_start$Y)*180/pi
+
+relative_position <- fourpoint_relative_position('four_point_position.csv')
+position_5 <- blue_start[, 1:2]
+position_6 <- red_start[, 1:2]
+
+space_position <- Generate_Points_position(position_5, position_6, relative_position)
+Sample_number <- length(blue_start$time_s) # 时间点数
+total.time <- blue_start$time_s[Sample_number] # 总时长
+time.axis <- blue_start$time_s # 时间轴数据
+time.matrix <- matrix(matrix(time.axis,5,Sample_number,byrow = T), 5*Sample_number, 1) # 时间矩阵，5*时间点数 X 1列 每一时刻时间值重复5次，然后下一个时间
+```
+
+# 三、产生轨迹图：容器轮廓 + 样品轨迹
+```{r}
+# Trace - Outline
+circle.x <- seq(from = origin[1]-R.px, to = origin[1]+R.px, by = 0.1)
+circle.x.1 <- c(circle.x, rev(circle.x))*scale.on.graph.mm_px
+circle.y.posi <- (video_height-origin[2]+sqrt(R.px^2-(circle.x-origin[1])^2))*scale.on.graph.mm_px
+circle.y.nega <- (video_height-origin[2]-sqrt(R.px^2-(circle.x-origin[1])^2))*scale.on.graph.mm_px
+
+outline <- data.frame(cbind(circle.x.1, c(circle.y.posi,circle.y.nega)))
+colnames(outline) <- c('X','Y')
+
+# Trace - Trace
+space_position_withTime <- data.frame(cbind(space_position, time.matrix))
+colnames(space_position_withTime)[5] <- 'time_s'
+```
+
+
+# 四、产生各项运动状态参数
+## 0. Displacement
+```{r}
+center.with.time.dataframe <- data.frame(cbind(time.axis,center))
+colnames(center.with.time.dataframe) <- c('Time.sec','X','Y')
+Disp.mm <- diff.para(data_infunc = center.with.time.dataframe, y_name = 'Disp.mm', type = 'disp')
+```
+
+## 1. Velocity
+```{r}
+center.with.time.dataframe <- data.frame(cbind(time.axis,center))
+colnames(center.with.time.dataframe) <- c('Time.sec','X','Y')
+Velocity.mm_sec <- diff.para(data_infunc = center.with.time.dataframe, y_name = 'V.mm.sec', type = 'v')
+# write.table(Velocity.mm_sec, file = 'Velocity.txt', sep = ',')
+```
+
+## 2. Velocity Direction and Velocity Direction change
+```{r}
+Position.t0.px <- center[-Sample_number,]
+Position.tt.px <- center[-1,]
+Velocity.Direction <- atan2(x = Position.tt.px$X - Position.t0.px$X, y = Position.tt.px$Y - Position.t0.px$Y)
+Velocity.Direction.degree <- Velocity.Direction*180/pi
+Velocity.Direction.degree <- c(Velocity.Direction.degree[1],Velocity.Direction.degree)
+
+Velocity.Direction.degree.dataframe.PRE <- data.frame(cbind(time.axis, Velocity.Direction.degree))
+colnames(Velocity.Direction.degree.dataframe.PRE) <- c('Time.sec', 'V.direct.deg')
+
+# -180 ~ 180度的角度图
+# write.table(Velocity.Direction.degree.dataframe.PRE, file = 'Velocity Direction degree PRE.txt', sep = ',')
+
+Velocity.Direction.degree.dataframe <- Angle.Continue(data_infunc = Velocity.Direction.degree.dataframe.PRE)
+Velocity.Direction.change.speed.RPM <- diff.para(data_infunc = Velocity.Direction.degree.dataframe, y_name = 'V.D.RPM', type = 'deg')
+
+# write.table(Velocity.Direction.degree.dataframe, file = 'Velocity Direction deg.txt', sep = ',')
+# write.table(Velocity.Direction.change.speed.RPM, file = 'Velocity Direction change RPM.txt', sep = ',')
+```
+
+## 3. Rotation degree & Rotation speed (RPM)
+```{r}
+Spin.Angle <- atan2(x = blue_start$X-red_start$X, y = blue_start$Y-red_start$Y)
+Spin.Angle.degree <- (Spin.Angle)*180/pi
+
+Spin.Angle.degree.dataframe.PRE <- data.frame(cbind(time.axis, Spin.Angle.degree))
+colnames(Spin.Angle.degree.dataframe.PRE) <- c('Time.sec', 'Spin.degree')
+
+# -180 ~ 180度的角度图
+# write.table(Spin.Angle.degree.dataframe.PRE, file = 'Spin angle degree PRE.txt', sep = ',')
+
+Spin.Angle.degree.dataframe <- Angle.Continue(data_infunc = Spin.Angle.degree.dataframe.PRE)
+Rotation.speed.RPM <- diff.para(data_infunc = Spin.Angle.degree.dataframe, y_name = 'R.RPM', type = 'deg')
+
+# write.table(Spin.Angle.degree.dataframe, file = 'Spin angle degree.txt', sep = ',')
+# write.table(Rotation.speed.RPM, file = 'Rotation speed RPM.txt', sep = ',')
+```
+
+## 4. Kinetics Energy (在用Origin smoothen完数据，保存好再运行此步骤)
+```{r}
+# 计算动能（假设是矩形）
+E_nJ <- Kinetics(r.m1 = r.m, a.m1 = a.m, b.m1 = b.m)
+time.axis.for.E <- Rotation.speed.RPM[,1]
+
+E_nJ.dataframe <- data.frame(cbind(time.axis.for.E, E_nJ))
+colnames(E_nJ.dataframe) <- c('Time.sec', 'E.nJ')
+
+# write.table(E_nJ.dataframe, file = 'E nJ.txt', sep = ',')
+```
+
+# 五、LOESS 平滑、导出数据、画图
+```{r}
+span.test <- 0.02
+# span.test <- 0.0022
+
+# Data before LOESS
+Disp.mm.LOSS <- Disp.mm
+Velocity.mm_sec.LOESS <- Velocity.mm_sec
+# Velocity.Direction.degree.dataframe.PRE
+Velocity.Direction.change.speed.RPM.LOESS <- Velocity.Direction.change.speed.RPM
+# Spin.Angle.degree.dataframe.PRE
+Rotation.speed.RPM.LOESS <- Rotation.speed.RPM
+E_nJ.dataframe.LOESS <- E_nJ.dataframe
+
+Velocity.mm_sec.LOESS[,2] <- (loess(
+  V.mm.sec ~ Time.sec, data = Velocity.mm_sec.LOESS, span = span.test))$fitted
+Velocity.Direction.change.speed.RPM.LOESS[,2] <- (loess(
+  V.D.RPM ~ Time.sec, data = Velocity.Direction.change.speed.RPM.LOESS, span = span.test))$fitted
+Rotation.speed.RPM.LOESS[,2] <- (loess(
+  R.RPM ~ Time.sec, data = Rotation.speed.RPM.LOESS, span = span.test))$fitted
+E_nJ.dataframe.LOESS[,2] <- (loess(
+  E.nJ ~ Time.sec, data = E_nJ.dataframe.LOESS, span = span.test))$fitted
+
+# 导出数据
+dim <- matrix(0,7)
+dim[1] <- dim(Velocity.mm_sec.LOESS)[1]
+dim[2] <- dim(Velocity.Direction.degree.dataframe.PRE)[1]
+dim[3] <- dim(Velocity.Direction.change.speed.RPM.LOESS)[1]
+dim[4] <- dim(Spin.Angle.degree.dataframe.PRE)[1]
+dim[5] <- dim(Rotation.speed.RPM.LOESS)[1]
+dim[6] <- dim(E_nJ.dataframe.LOESS)[1]
+dim[7] <- dim(Disp.mm.LOSS)[1]
+final.length <- min(dim)
+Summary <- data.frame(matrix(NA, nrow = final.length, ncol = 12))
+Summary[,1:2] <- Velocity.Direction.degree.dataframe.PRE[1:final.length,]
+Summary[,3:4] <- Velocity.Direction.change.speed.RPM.LOESS[1:final.length,]
+Summary[,5:6] <- Spin.Angle.degree.dataframe.PRE[1:final.length,]
+Summary[,7:8] <- Rotation.speed.RPM.LOESS[1:final.length,]
+Summary[,9:10] <- Velocity.mm_sec.LOESS[1:final.length,]
+Summary[,11:12] <- E_nJ.dataframe.LOESS[1:final.length,]
+Summary[,13:14] <- Disp.mm.LOSS[1:final.length,]
+
+colnames(Summary) <- c(colnames(Velocity.Direction.degree.dataframe.PRE),
+                       colnames(Velocity.Direction.change.speed.RPM.LOESS),
+                       colnames(Spin.Angle.degree.dataframe.PRE),
+                       colnames(Rotation.speed.RPM.LOESS),
+                       colnames(Velocity.mm_sec.LOESS),
+                       colnames(E_nJ.dataframe.LOESS),
+                       colnames(Disp.mm.LOSS))
+
+write.table(Summary, file = sprintf('Para-Summary-%s-%s.txt', time.interval, span.test), sep = ',')
+
+# Plot
+dir.create(sprintf('%s-plot-%s', time.interval, span.test))
+path1 <- getwd()
+setwd(sprintf('%s/%s-plot-%s', path1, time.interval, span.test))
+for (i in seq(from = time.axis[1], to = time.axis[length(time.axis)-1], by = time.interval)){
+  name <- sprintf('%s-%d.png', sample_ID, ((i-time.axis[1])%/%time.interval+1))
+  png(name, width = 2*1980, height = 2*1080, units = 'px', res = 300)
+  g0 <- ggplot(data = subset(space_position_withTime, time_s > i  & time_s < (time.interval+i)), 
+               aes(x = X*scale.on.graph.mm_px, y = (video_height-Y)*scale.on.graph.mm_px))
+  g0 <- g0 +  geom_path(aes(group = Sample_No, colour = time_s), size = 1, alpha = alpha_factor.trace)
+  g0 <- g0 +  geom_path(data = outline, aes(x = X, y = Y), size = 1, linetype = 2)
+  g0 <- g0 +  coord_fixed(ratio = 1)
+  g0 <- g0 +  scale_color_gradientn(name = 'Time (s)', colors = topo.colors(Sample_number))
+  g0 <- g0 +  labs(x = 'X (mm)', y = 'Y (mm)', title = 'Trace of sample')
+  g0 <- g0 +  theme_classic()
+  
+  data_use1 <- subset(Velocity.mm_sec.LOESS, Time.sec > i & Time.sec < (time.interval + i))
+  data_use2 <- subset(Velocity.Direction.degree.dataframe.PRE, Time.sec > i & Time.sec < (time.interval + i))
+  data_use3 <- subset(Velocity.Direction.change.speed.RPM.LOESS, Time.sec > i & Time.sec < (time.interval + i))
+  data_use4 <- subset(Spin.Angle.degree.dataframe.PRE, Time.sec > i & Time.sec < (time.interval + i))
+  data_use5 <- subset(Rotation.speed.RPM.LOESS, Time.sec > i & Time.sec < (time.interval + i))
+  data_use6 <- subset(E_nJ.dataframe.LOESS, Time.sec > i & Time.sec < (time.interval + i))
+  
+  g1 <- datacurve(data_infunc = data_use1, draw_line = 1)
+  g1 <- g1 + geom_line(stat = 'smooth', method = 'loess', span = 0.3, alpha = 0.4, linetype = 5, size = 0.7, colour = 'red')
+  
+  g2 <- datacurve(data_infunc = data_use2, yLowerLim = -180, yUpperLim = 180)
+  
+  g3 <- datacurve(data_infunc = data_use3, draw_line = 1)
+  g3 <- g3 + geom_line(stat = 'smooth', method = 'loess', span = 0.3, alpha = 0.4, linetype = 5, size = 0.7, colour = 'red')
+  
+  g4 <- datacurve(data_infunc = data_use4, yLowerLim = -180, yUpperLim = 180)
+  
+  g5 <- datacurve(data_infunc = data_use5, draw_line = 1)
+  g5 <- g5 + geom_line(stat = 'smooth', method = 'loess', span = 0.3, alpha = 0.4, linetype = 5, size = 0.7, colour = 'red')
+  
+  g6 <- datacurve(data_infunc = data_use6, draw_line = 1)
+  g6 <- g6 + theme_bw()
+  g6 <- g6 + theme(panel.grid.minor = element_blank())
+  g6 <- g6 + geom_line(stat = 'smooth', method = 'loess', span = 0.3, alpha = 0.4, linetype = 5, size = 0.7, colour = 'red')
+  
+  plot.list <- list(g1,g2,g3,g4,g5,g6)
+  pm <- ggmatrix(plot.list, 6,1, yAxisLabels = c('V(mm/s)', 'Direct(deg)', 'Revol(RPM)', 'Spin(deg)', 'Rotat(RPM)', 'Ek(nJ)'), xAxisLabels = 'Time(s)')
+  multiplot(g0,pm, layout = matrix(c(1,1,1,2,2),1,5))
+  dev.off()
+}
+```
+
+```{r}
+# Use to run all codes
+```
